@@ -1,0 +1,452 @@
+/*
+ * This file is part of OpenTV.
+ * Copyright (C) 2026 The OpenTV Contributors
+ * Licensed under the GNU General Public License v3.0 or later.
+ */
+package app.opentv.ui.channels
+
+import androidx.compose.animation.core.animateDpAsState
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Star
+import androidx.compose.material.icons.outlined.StarOutline
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableLongStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.compose.ui.res.stringResource
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.viewmodel.compose.viewModel
+import android.view.WindowManager
+import androidx.compose.ui.window.Dialog
+import app.opentv.R
+import app.opentv.core.AppSettings
+import app.opentv.core.ServiceLocator
+import app.opentv.core.findActivity
+import app.opentv.data.model.Channel
+import app.opentv.data.model.Programme
+import app.opentv.data.model.Reminder
+import app.opentv.data.model.shownName
+import app.opentv.reminders.ReminderScheduler
+import app.opentv.player.PlaybackQueue
+import app.opentv.player.PlayerController
+import app.opentv.ui.ChannelsViewModel
+import coil.compose.AsyncImage
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+
+/**
+ * Live TV: a category rail on the left, the channel list on the right.
+ *
+ * The rail is vertical because provider category lists run to dozens of entries and a
+ * horizontal chip row hides all but the first few — on a d-pad, anything you cannot see
+ * you cannot reach. Favourites and All are pinned at the top.
+ *
+ * The list shows what is on *now* and *next* against every channel. That doubles as a
+ * permanent, glanceable health indicator for the guide: when the EPG stops updating, these
+ * lines say so honestly instead of going quietly stale.
+ */
+@Composable
+fun HomeScreen(
+    isTelevision: Boolean,
+    hasSources: Boolean,
+    isSyncing: Boolean,
+    onPlayChannel: (Channel) -> Unit,
+    onAddSource: () -> Unit,
+    onRefresh: () -> Unit,
+    onPlayCatchup: (mediaKey: String, url: String, title: String, ua: String) -> Unit = { _, _, _, _ -> },
+    viewModel: ChannelsViewModel = viewModel(),
+) {
+    val context = LocalContext.current
+    val graph = remember { ServiceLocator.get(context) }
+    val settings = remember { graph.settings }
+    val previewEnabled by settings.guidePreviewVideo.collectAsState()
+    val channelLayout by settings.channelLayout.collectAsState()
+
+    val categories by viewModel.visibleCategoryGroups.collectAsState()
+    val rows by viewModel.rows.collectAsState()
+    val selectedCategory by viewModel.selectedCategory.collectAsState()
+    val favouritesOnly by viewModel.favouritesOnly.collectAsState()
+    val selectedSource by viewModel.selectedSource.collectAsState()
+    val windowStart by viewModel.windowStartMillis.collectAsState()
+    // How many days ahead the guide is scrolled (0 = live now). Drives the ‹ Today › nav.
+    val guideDayOffset by viewModel.guideDayOffset.collectAsState()
+    // Tri-state: null = still checking the catalogue, true = channels on disk, false = confirmed
+    // empty. Drives the choice between the loading spinner and a recoverable error below.
+    val channelsPresent by viewModel.channelsPresent.collectAsState()
+
+    // Two separate ideas, on purpose:
+    //  - highlightedRow: where the d-pad is in the grid. Moves freely with up/down.
+    //  - selectedRow: what the preview pane plays. Only changes when you press OK, so scrolling
+    //    the list is calm and silent instead of re-tuning a stream on every keypress.
+    var highlightedRow by remember { mutableStateOf<ChannelsViewModel.Row?>(null) }
+    var selectedRow by remember { mutableStateOf<ChannelsViewModel.Row?>(null) }
+    val previewSound by settings.guidePreviewSound.collectAsState()
+    var nowMillis by remember { mutableLongStateOf(System.currentTimeMillis()) }
+
+    // ---- Category rail collapse (Change 2) ---------------------------------------------------
+    // The rail is full-width while focus is on it, then slides shut once focus moves into the
+    // guide (onFocusRow) so the grid gets the whole width. Pressing d-pad LEFT from the guide's
+    // leftmost (channel) column slides it back and drops focus on the selected category.
+    var railExpanded by remember { mutableStateOf(true) }
+    val railWidth by animateDpAsState(
+        targetValue = if (railExpanded) 240.dp else 0.dp,
+        label = "railWidth",
+    )
+    val railFocusRequester = remember { FocusRequester() }
+    // Set when LEFT reopens the rail; the effect waits for the rail to be laid out again before
+    // moving focus onto it — a just-revealed node isn't focusable on the very same frame.
+    var pendingRailFocus by remember { mutableStateOf(false) }
+    LaunchedEffect(pendingRailFocus) {
+        if (pendingRailFocus) {
+            delay(50)
+            // runCatching: if the selected category is scrolled out of the rail's list it may not
+            // be composed; a second LEFT press then still reaches the rail by ordinary navigation.
+            runCatching { railFocusRequester.requestFocus() }
+            pendingRailFocus = false
+        }
+    }
+
+    // Re-evaluate "now" once a minute so progress bars advance without leaving the screen.
+    LaunchedEffect(Unit) {
+        while (true) {
+            nowMillis = System.currentTimeMillis()
+            viewModel.tick()
+            delay(60_000)
+        }
+    }
+
+    // Keep both valid as the list changes (e.g. switching category): stay on the same channel if
+    // it's still present, otherwise fall back to the top of the new list.
+    LaunchedEffect(rows) {
+        highlightedRow = rows.firstOrNull { it.key == highlightedRow?.key } ?: rows.firstOrNull()
+        selectedRow = rows.firstOrNull { it.key == selectedRow?.key } ?: rows.firstOrNull()
+    }
+
+    // ---- Live preview player -----------------------------------------------------------------
+    // One muted player, reused. It only ever decodes while the guide is the foreground screen,
+    // and is stopped before any hand-off to full-screen, so the box never runs two decoders at
+    // once — the thing that used to lock up cheap sticks.
+    val previewScope = remember { CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate) }
+    val previewController = remember {
+        PlayerController(context, previewScope, graph.httpClient, subtitlesEnabled = false, preview = true)
+            .also { it.player.volume = 0f }
+    }
+    DisposableEffect(Unit) {
+        onDispose {
+            previewController.release()
+            previewScope.cancel()
+        }
+    }
+
+    fun startLive(channel: Channel) {
+        PlaybackQueue.items = rows.map {
+            PlaybackQueue.Item(it.primary.id, it.primary.shownName, it.primary.logoUrl, it.primary.number)
+        }
+        previewController.stop()
+        onPlayChannel(channel)
+    }
+    fun requestLive(channel: Channel) = startLive(channel)
+
+    val lifecycleOwner = LocalLifecycleOwner.current
+    var screenResumed by remember { mutableStateOf(true) }
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            when (event) {
+                Lifecycle.Event.ON_RESUME -> screenResumed = true
+                Lifecycle.Event.ON_PAUSE -> {
+                    screenResumed = false
+                    previewController.stop()
+                }
+                else -> Unit
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
+    // Hold the screen awake while the guide's live preview is playing — otherwise the box's
+    // screensaver fires while you're browsing with a channel running in the preview pane.
+    DisposableEffect(previewEnabled, screenResumed) {
+        val window = context.findActivity()?.window
+        if (previewEnabled && screenResumed) {
+            window?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        } else {
+            window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
+        onDispose { window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON) }
+    }
+
+    // Preview audio follows the setting; muted by default so browsing stays quiet.
+    LaunchedEffect(previewSound) {
+        previewController.player.volume = if (previewSound) 1f else 0f
+    }
+
+    // Tune the preview to the highlighted channel, so it follows the d-pad as you browse.
+    LaunchedEffect(highlightedRow?.key, previewEnabled, screenResumed) {
+        val row = highlightedRow
+        if (!previewEnabled || !screenResumed || row == null) {
+            previewController.stop()
+            return@LaunchedEffect
+        }
+        val channel = row.primary
+        val source = graph.sourceRepository.byId(channel.sourceId)
+        previewController.play(
+            PlayerController.Request(
+                url = channel.streamUrl,
+                title = channel.shownName,
+                userAgent = source?.userAgent ?: "OpenTV/0.1 (Android)",
+                isLive = true,
+            ),
+            debounce = true,
+        )
+    }
+
+    Row(Modifier.fillMaxSize()) {
+
+        // ---- Category rail -----------------------------------------------------------------
+        // Width animates to 0 while focus is in the guide (see onFocusRow) so the grid gets the
+        // whole screen; d-pad LEFT from the guide's channel column slides it back (onExitLeft…).
+        Column(
+            Modifier
+                .width(railWidth)
+                .fillMaxHeight()
+                .background(MaterialTheme.colorScheme.surface)
+                .clipToBounds()
+                .padding(vertical = 16.dp),
+        ) {
+            Text(
+                stringResource(R.string.nav_live_tv),
+                style = MaterialTheme.typography.headlineMedium,
+                modifier = Modifier.padding(horizontal = 20.dp),
+            )
+            Spacer(Modifier.height(12.dp))
+            // The top "Search channels" bar was removed — Search now lives in the global nav rail.
+
+            LazyColumn(
+                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                verticalArrangement = Arrangement.spacedBy(2.dp),
+            ) {
+                // Provider switch — only when there's more than one source. Lets the user keep
+                // several playlists and flip between them (cardiodoc's request); "All" folds them.
+                if (sources.size > 1) {
+                    item(key = "provider-header") {
+                        Text(
+                            stringResource(R.string.channels_manager_source_header),
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                        )
+                    }
+                    item(key = "provider-all") {
+                        RailEntry(
+                            label = stringResource(R.string.channels_manager_all_sources),
+                            selected = selectedSource == null,
+                            onClick = { viewModel.selectSource(null) },
+                        )
+                    }
+                    items(sources, key = { "src-${it.id}" }) { source ->
+                        RailEntry(
+                            label = source.name,
+                            selected = selectedSource == source.id,
+                            onClick = { viewModel.selectSource(source.id) },
+                        )
+                    }
+                    item(key = "provider-divider") { Spacer(Modifier.height(10.dp)) }
+                }
+                // The currently-selected entry carries the rail's FocusRequester, so reopening the
+                // rail (d-pad LEFT in the guide) lands focus straight back on the current category.
+                item {
+                    RailEntry(
+                        label = stringResource(R.string.guide_favourites),
+                        selected = favouritesOnly,
+                        onClick = viewModel::selectFavourites,
+                        modifier = if (favouritesOnly) Modifier.focusRequester(railFocusRequester) else Modifier,
+                    )
+                }
+                item {
+                    val allSelected = !favouritesOnly && selectedCategory == null
+                    RailEntry(
+                        label = stringResource(R.string.guide_all_channels),
+                        selected = allSelected,
+                        onClick = { viewModel.selectCategory(null) },
+                        modifier = if (allSelected) Modifier.focusRequester(railFocusRequester) else Modifier,
+                    )
+                }
+                items(categories, key = { it.key }) { group ->
+                    val groupSelected = !favouritesOnly && selectedCategory == group.key
+                    RailEntry(
+                        label = group.label,
+                        selected = groupSelected,
+                        onClick = { viewModel.selectCategory(group.key) },
+                        modifier = if (groupSelected) Modifier.focusRequester(railFocusRequester) else Modifier,
+                    )
+                }
+            }
+        }
+
+        // ---- Preview + guide ---------------------------------------------------------------
+        Column(Modifier.weight(1f)) {
+            if (rows.isEmpty()) {
+                when {
+                    favouritesOnly -> NoFavouritesState()
+                    // Work genuinely in progress: a sync is running, the catalogue check hasn't
+                    // returned yet, or channels ARE on disk and the guide is still building. A
+                    // large provider takes a while, and showing "No channels" during it reads as
+                    // failure — which is how someone concludes an app is broken thirty seconds
+                    // after installing it.
+                    isSyncing || channelsPresent == null || channelsPresent == true -> LoadingState(isSyncing)
+                    // Nothing is syncing and the catalogue is confirmed empty. With a provider
+                    // configured, the last load failed or returned nothing — surface a clear error
+                    // with Retry and a way back to setup instead of spinning forever.
+                    hasSources -> ChannelsErrorState(onRetry = onRefresh, onEditProvider = onAddSource)
+                    else -> EmptyState(onAddSource)
+                }
+            } else {
+                // Hand the player the list you're browsing so it can zap channel up/down.
+                fun goFullscreen(channel: Channel) = requestLive(channel)
+
+
+                val dayLabel = when (guideDayOffset) {
+                    0 -> stringResource(R.string.guide_today)
+                    1 -> stringResource(R.string.guide_tomorrow)
+                    else -> remember(windowStart) {
+                        SimpleDateFormat("EEE d MMM", Locale.getDefault()).format(Date(windowStart))
+                    }
+                }
+                GuidePreview(
+                    row = highlightedRow,
+                    nowMillis = nowMillis,
+                    onWatch = { highlightedRow?.let { goFullscreen(it.primary) } },
+                    onRefresh = onRefresh,
+                    onAddSource = onAddSource,
+                    previewPlayer = if (previewEnabled) previewController.player else null,
+                    dayLabel = dayLabel,
+                    canGoPrevDay = guideDayOffset > 0,
+                    onPrevDay = { viewModel.nudgeGuideDay(-1) },
+                    onNextDay = { viewModel.nudgeGuideDay(1) },
+                )
+                // Shared by both layouts: focus follows the highlight and collapses the rail; LEFT
+                // from the leftmost element reopens the rail (consumed only when it was hidden).
+                val onFocusChannel: (ChannelsViewModel.Row) -> Unit = {
+                    highlightedRow = it
+                    railExpanded = false
+                }
+                val onExitLeftChannel: () -> Boolean = {
+                    if (!railExpanded) {
+                        railExpanded = true
+                        pendingRailFocus = true
+                        true
+                    } else {
+                        false
+                    }
+                }
+                if (channelLayout == AppSettings.ChannelLayout.LIST) {
+                    ChannelList(
+                        rows = rows,
+                        selectedKey = highlightedRow?.key,
+                        onSelectRow = { row -> requestLive(row.primary) },
+                        onFocusRow = onFocusChannel,
+                        onToggleFavourite = { viewModel.toggleFavourite(it) },
+                        onExitLeftFromChannel = onExitLeftChannel,
+                        modifier = Modifier.weight(1f).padding(start = 12.dp, end = 12.dp),
+                    )
+                } else {
+                    GuideGrid(
+                        rows = rows,
+                        windowStartMillis = windowStart,
+                        dayOffset = guideDayOffset,
+                        selectedKey = highlightedRow?.key,
+                        // OK on a channel opens its menu: Watch, Record now, Schedule a later show,
+                        // Record series. The preview already follows the highlight as you browse.
+                        onSelectRow = { row -> requestLive(row.primary) },
+                        onFocusRow = onFocusChannel,
+                        onProgramme = { _, _ -> Unit },
+                        onToggleFavourite = { viewModel.toggleFavourite(it) },
+                        onExitLeftFromChannel = onExitLeftChannel,
+                        modifier = Modifier.weight(1f).padding(start = 12.dp, end = 12.dp),
+                    )
+                }
+            }
+        }
+    }
+
+}
+
+/** Inserts a reminder for a future programme and arms its alarm. No-op if one already exists. */
+private suspend fun setReminder(
+    graph: ServiceLocator.Graph,
+    context: android.content.Context,
+    channel: Channel,
+    programme: Programme,
+    autoTune: Boolean,
+) {
+    if (graph.reminderRepository.forProgramme(channel.id, programme.startUtcMillis) != null) return
+    val id = graph.reminderRepository.insert(
+        Reminder(
+            channelId = channel.id,
+            channelName = channel.displayName,
+            logoUrl = channel.logoUrl,
+            title = programme.title,
+            startUtcMillis = programme.startUtcMillis,
+            endUtcMillis = programme.endUtcMillis,
+            autoTune = autoTune,
+            createdAtMillis = System.currentTimeMillis(),
+        ),
+    )
+    ReminderScheduler.set(context, id, programme.startUtcMillis)
+}
